@@ -31,9 +31,21 @@ pub const Allocation = struct {
     data: []align(8) u8,
 };
 
+pub const FunctionPointers = struct {
+    getPhysicalDeviceProperties: vk.PfnGetPhysicalDeviceProperties,
+    getPhysicalDeviceMemoryProperties: vk.PfnGetPhysicalDeviceMemoryProperties,
+
+    allocateMemory: vk.PfnAllocateMemory,
+    freeMemory: vk.PfnFreeMemory,
+    mapMemory: vk.PfnMapMemory,
+    unmapMemory: vk.PfnUnmapMemory,
+};
+
 pub const Allocator = struct {
     const Self = @This();
     allocator: *mem.Allocator,
+
+    pfn: FunctionPointers,
 
     device: vk.Device,
     image_granularity: vk.DeviceSize,
@@ -46,14 +58,21 @@ pub const Allocator = struct {
     chunk_id: usize = 0,
     chunk_count: usize = 0,
 
-    pub fn init(allocator: *mem.Allocator, physicalDevice: vk.PhysicalDevice, device: vk.Device, chunkSize: vk.DeviceSize) Self {
+    pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, physicalDevice: vk.PhysicalDevice, device: vk.Device, chunkSize: vk.DeviceSize) Self {
+        var properties: vk.PhysicalDeviceProperties = undefined;
+        pfn.getPhysicalDeviceProperties(physicalDevice, &properties);
+        var memProperties: vk.PhysicalDeviceMemoryProperties = undefined;
+        pfn.getPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
         return Self{
             .allocator = allocator,
 
+            .pfn = pfn,
+
             .device = device,
-            .image_granularity = vk.GetPhysicalDeviceProperties(physicalDevice).limits.bufferImageGranularity,
-            .memory_types = vk.GetPhysicalDeviceMemoryProperties(physicalDevice).memoryTypes,
-            .memory_type_count = vk.GetPhysicalDeviceMemoryProperties(physicalDevice).memoryTypeCount,
+            .image_granularity = properties.limits.buffer_image_granularity,
+            .memory_types = memProperties.memory_types,
+            .memory_type_count = memProperties.memory_type_count,
 
             .chunk_size = chunkSize * 1024 * 1024,
 
@@ -71,19 +90,19 @@ pub const Allocator = struct {
     }
 
     pub fn alloc(self: *Self, size: vk.DeviceSize, alignment: vk.DeviceSize, memoryTypeBits: u32, usage: MemoryUsage, allocType: AllocationType) !Allocation {
-        var requiredFlags: vk.MemoryPropertyFlags = vk.MemoryPropertyFlags.fromInt(0);
-        var preferredFlags: vk.MemoryPropertyFlags = vk.MemoryPropertyFlags.fromInt(0);
+        var requiredFlags: vk.MemoryPropertyFlags = .{};
+        var preferredFlags: vk.MemoryPropertyFlags = .{};
 
         switch (usage) {
-            .GpuOnly => preferredFlags = preferredFlags.with(vk.MemoryPropertyFlags{ .deviceLocal = true }),
-            .CpuOnly => requiredFlags = requiredFlags.with(vk.MemoryPropertyFlags{ .hostVisible = true, .hostCoherent = true }),
+            .GpuOnly => preferredFlags = preferredFlags.merge(vk.MemoryPropertyFlags{ .device_local_bit = true }),
+            .CpuOnly => requiredFlags = requiredFlags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true, .host_coherent_bit = true }),
             .GpuToCpu => {
-                requiredFlags = requiredFlags.with(vk.MemoryPropertyFlags{ .hostVisible = true });
-                preferredFlags = preferredFlags.with(vk.MemoryPropertyFlags{ .hostCoherent = true, .hostCached = true });
+                requiredFlags = requiredFlags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true });
+                preferredFlags = preferredFlags.merge(vk.MemoryPropertyFlags{ .host_coherent_bit = true, .host_cached_bit = true });
             },
             .CpuToGpu => {
-                requiredFlags = requiredFlags.with(vk.MemoryPropertyFlags{ .hostVisible = true });
-                preferredFlags = preferredFlags.with(vk.MemoryPropertyFlags{ .deviceLocal = true });
+                requiredFlags = requiredFlags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true });
+                preferredFlags = preferredFlags.merge(vk.MemoryPropertyFlags{ .device_local_bit = true });
             },
         }
 
@@ -95,9 +114,10 @@ pub const Allocator = struct {
                 continue;
             }
 
-            const properties = self.memory_types[memoryTypeIndex].propertyFlags;
-            if (!properties.hasAllSet(requiredFlags)) continue;
-            if (!properties.hasAllSet(preferredFlags)) continue;
+            const properties = self.memory_types[memoryTypeIndex].property_flags;
+
+            if (!properties.contains(requiredFlags)) continue;
+            if (!properties.contains(preferredFlags)) continue;
 
             indexFound = true;
             break;
@@ -110,8 +130,8 @@ pub const Allocator = struct {
                     continue;
                 }
 
-                const properties = self.memory_types[memoryTypeIndex].propertyFlags;
-                if (!properties.hasAllSet(requiredFlags)) continue;
+                const properties = self.memory_types[memoryTypeIndex].property_flags;
+                if (!properties.contains(requiredFlags)) continue;
 
                 indexFound = true;
                 break;
@@ -130,7 +150,7 @@ pub const Allocator = struct {
         if (self.chunk_count >= vk.MAX_MEMORY_TYPES) return error.CannotMakeNewChunk;
 
         var chunk = try self.allocator.create(Chunk);
-        chunk.* = try Chunk.init(self.allocator, self.device, self.chunk_size, usage, memoryTypeIndex, self.chunk_id);
+        chunk.* = try Chunk.init(self.allocator, self.pfn, self.device, self.chunk_size, usage, memoryTypeIndex, self.chunk_id);
         try self.chunks.put(self.chunk_id, chunk);
         self.chunk_id += 1;
         self.chunk_count += 1;
@@ -170,6 +190,8 @@ const Chunk = struct {
 
     allocator: *mem.Allocator,
 
+    pfn: FunctionPointers,
+
     device: vk.Device,
 
     memory: vk.DeviceMemory,
@@ -184,23 +206,22 @@ const Chunk = struct {
     block_id: vk.DeviceSize,
     head: *Block,
 
-    pub fn init(allocator: *mem.Allocator, device: vk.Device, size: vk.DeviceSize, usage: MemoryUsage, memoryTypeIndex: u32, id: vk.DeviceSize) !Chunk {
+    pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, device: vk.Device, size: vk.DeviceSize, usage: MemoryUsage, memoryTypeIndex: u32, id: vk.DeviceSize) !Chunk {
         if (memoryTypeIndex == std.math.maxInt(u64)) {
             return error.InvalidAllocationTypeIndex;
         }
 
         const allocationInfo = vk.MemoryAllocateInfo{
-            .allocationSize = size,
+            .allocation_size = size,
 
-            .memoryTypeIndex = memoryTypeIndex,
+            .memory_type_index = memoryTypeIndex,
         };
 
-        const memory = try vk.AllocateMemory(device, allocationInfo, null);
+        var memory: vk.DeviceMemory = undefined;
+        std.debug.assert(pfn.allocateMemory(device, &allocationInfo, null, &memory) == .success);
 
         var data: []align(8) u8 = undefined;
-        if (usage != .GpuOnly) {
-            try vk.MapMemory(device, memory, 0, size, vk.MemoryMapFlags.fromInt(0), @ptrCast(?**c_void, &data));
-        }
+        if (usage != .GpuOnly) std.debug.assert(pfn.mapMemory(device, memory, 0, size, 0, @ptrCast(*?*c_void, &data)) == .success);
 
         var head = try allocator.create(Block);
         head.* = Block{
@@ -219,6 +240,8 @@ const Chunk = struct {
             .id = id,
 
             .allocator = allocator,
+
+            .pfn = pfn,
 
             .device = device,
 
@@ -240,10 +263,10 @@ const Chunk = struct {
         self.deinitBlock(self.head);
 
         if (self.usage != .GpuOnly) {
-            vk.UnmapMemory(self.device, self.memory);
+            self.pfn.unmapMemory(self.device, self.memory);
         }
 
-        vk.FreeMemory(self.device, self.memory, null);
+        self.pfn.freeMemory(self.device, self.memory, null);
     }
 
     fn deinitBlock(self: Chunk, block: *Block) void {
