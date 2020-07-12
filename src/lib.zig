@@ -85,6 +85,7 @@ pub const Allocator = struct {
     pub fn deinit(self: *Self) void {
         for (self.chunks.items()) |*chunk| {
             chunk.value.deinit();
+            self.allocator.destroy(chunk.value);
         }
         self.chunks.deinit();
     }
@@ -155,7 +156,7 @@ pub const Allocator = struct {
         self.chunk_id += 1;
         self.chunk_count += 1;
 
-        const allocation = try self.chunks.get(self.chunk_id - 1).?.alloc(size, alignment, self.image_granularity, allocType);
+        const allocation = try chunk.alloc(size, alignment, self.image_granularity, allocType);
 
         return allocation.?;
     }
@@ -163,13 +164,21 @@ pub const Allocator = struct {
     pub fn free(self: *Self, allocation: Allocation) void {
         var chunk = self.chunks.get(allocation.chunk_id).?;
         chunk.free(allocation);
+    }
 
-        // if (chunk.allocated == 0) {
-        //     chunk.deinit();
-        //     self.allocator.destroy(chunk);
-        //     self.chunks.removeAssertDiscard(allocation.chunk_id);
-        //     self.chunk_count -= 1;
-        // }
+    // Garbage Collect
+    pub fn gc(self: *Self) !void {
+        var items = try self.chunks.clone();
+        for (items.items()) |*chunk| {
+            if (chunk.value.allocated == 0) {
+                var id = chunk.value.id;
+                chunk.value.deinit();
+                self.allocator.destroy(chunk.value);
+                self.chunks.removeAssertDiscard(id);
+                self.chunk_count -= 1;
+            }
+        }
+        items.deinit();
     }
 };
 
