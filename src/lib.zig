@@ -148,8 +148,6 @@ pub const Allocator = struct {
             if (allocation == null) break else return allocation.?;
         }
 
-        if (self.chunk_count >= vk.MAX_MEMORY_TYPES) return error.CannotMakeNewChunk;
-
         var chunk = try self.allocator.create(Chunk);
         chunk.* = try Chunk.init(self.allocator, self.pfn, self.device, self.chunk_size, usage, memoryTypeIndex, self.chunk_id);
         try self.chunks.put(self.chunk_id, chunk);
@@ -227,10 +225,10 @@ const Chunk = struct {
         };
 
         var memory: vk.DeviceMemory = undefined;
-        std.debug.assert(pfn.allocateMemory(device, &allocationInfo, null, &memory) == .success);
+        if (pfn.allocateMemory(device, &allocationInfo, null, &memory) != .success) return error.CannotMakeNewChunk;
 
         var data: []align(8) u8 = undefined;
-        if (usage != .GpuOnly) std.debug.assert(pfn.mapMemory(device, memory, 0, size, 0, @ptrCast(*?*c_void, &data)) == .success);
+        if (usage != .GpuOnly) if(pfn.mapMemory(device, memory, 0, size, 0, @ptrCast(*?*c_void, &data)) != .success) return error.MapMemoryFailed;
 
         var head = try allocator.create(Block);
         head.* = Block{
