@@ -393,7 +393,7 @@ const Chunk = struct {
 
             prev.size += curr.?.size;
 
-            self.allocator.destroy(curr);
+            self.allocator.destroy(curr.?);
         }
 
         if (curr.?.next != null and curr.?.next.?.atype == .Free) {
