@@ -20,8 +20,9 @@ pub const MemoryUsage = enum {
 };
 
 pub const Allocation = struct {
-    chunk_id: vk.DeviceSize,
     block_id: vk.DeviceSize,
+    span_id: vk.DeviceSize,
+    memory_type_index: u32,
 
     memory: vk.DeviceMemory,
 
@@ -41,233 +42,54 @@ pub const FunctionPointers = struct {
     unmapMemory: vk.PfnUnmapMemory,
 };
 
-pub const Allocator = struct {
-    const Self = @This();
-    allocator: *mem.Allocator,
-
-    pfn: FunctionPointers,
-
-    device: vk.Device,
-    image_granularity: vk.DeviceSize,
-    memory_types: [vk.MAX_MEMORY_TYPES]vk.MemoryType,
-    memory_type_count: u32,
-
-    chunk_size: vk.DeviceSize,
-
-    chunks: std.AutoHashMap(usize, *Chunk),
-    chunk_id: usize = 0,
-    chunk_count: usize = 0,
-
-    pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, physicalDevice: vk.PhysicalDevice, device: vk.Device, chunkSize: vk.DeviceSize) Self {
-        var properties: vk.PhysicalDeviceProperties = undefined;
-        pfn.getPhysicalDeviceProperties(physicalDevice, &properties);
-        var memProperties: vk.PhysicalDeviceMemoryProperties = undefined;
-        pfn.getPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
-
-        return Self{
-            .allocator = allocator,
-
-            .pfn = pfn,
-
-            .device = device,
-            .image_granularity = properties.limits.buffer_image_granularity,
-            .memory_types = memProperties.memory_types,
-            .memory_type_count = memProperties.memory_type_count,
-
-            .chunk_size = chunkSize * 1024 * 1024,
-
-            .chunks = std.AutoHashMap(usize, *Chunk).init(allocator),
-            .chunk_id = 0,
-            .chunk_count = 0,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        for (self.chunks.items()) |*chunk| {
-            chunk.value.deinit();
-            self.allocator.destroy(chunk.value);
-        }
-        self.chunks.deinit();
-    }
-
-    pub fn alloc(self: *Self, size: vk.DeviceSize, alignment: vk.DeviceSize, memoryTypeBits: u32, usage: MemoryUsage, allocType: AllocationType) !Allocation {
-        var requiredFlags: vk.MemoryPropertyFlags = .{};
-        var preferredFlags: vk.MemoryPropertyFlags = .{};
-
-        switch (usage) {
-            .GpuOnly => preferredFlags = preferredFlags.merge(vk.MemoryPropertyFlags{ .device_local_bit = true }),
-            .CpuOnly => requiredFlags = requiredFlags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true, .host_coherent_bit = true }),
-            .GpuToCpu => {
-                requiredFlags = requiredFlags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true });
-                preferredFlags = preferredFlags.merge(vk.MemoryPropertyFlags{ .host_coherent_bit = true, .host_cached_bit = true });
-            },
-            .CpuToGpu => {
-                requiredFlags = requiredFlags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true });
-                preferredFlags = preferredFlags.merge(vk.MemoryPropertyFlags{ .device_local_bit = true });
-            },
-        }
-
-        var memoryTypeIndex: u32 = 0;
-        var indexFound = false;
-
-        while (memoryTypeIndex < self.memory_type_count) : (memoryTypeIndex += 1) {
-            if ((memoryTypeBits >> @intCast(u5, memoryTypeIndex)) & 1 == 0) {
-                continue;
-            }
-
-            const properties = self.memory_types[memoryTypeIndex].property_flags;
-
-            if (!properties.contains(requiredFlags)) continue;
-            if (!properties.contains(preferredFlags)) continue;
-
-            indexFound = true;
-            break;
-        }
-
-        if (!indexFound) {
-            memoryTypeIndex = 0;
-            while (memoryTypeIndex < self.memory_type_count) : (memoryTypeIndex += 1) {
-                if ((memoryTypeBits >> @intCast(u5, memoryTypeIndex)) & 1 == 0) {
-                    continue;
-                }
-
-                const properties = self.memory_types[memoryTypeIndex].property_flags;
-                if (!properties.contains(requiredFlags)) continue;
-
-                indexFound = true;
-                break;
-            }
-        }
-
-        if (!indexFound) return error.MemoryTypeIndexNotFound;
-
-        for (self.chunks.items()) |*chunk| {
-            if (chunk.value.memory_type_index != memoryTypeIndex) continue;
-
-            const allocation = try chunk.value.alloc(size, alignment, self.image_granularity, allocType);
-            if (allocation == null) break else return allocation.?;
-        }
-
-        var chunk = try self.allocator.create(Chunk);
-        chunk.* = try Chunk.init(self.allocator, self.pfn, self.device, self.chunk_size, usage, memoryTypeIndex, self.chunk_id);
-        try self.chunks.put(self.chunk_id, chunk);
-        self.chunk_id += 1;
-        self.chunk_count += 1;
-
-        const allocation = try chunk.alloc(size, alignment, self.image_granularity, allocType);
-
-        return allocation.?;
-    }
-
-    pub fn free(self: *Self, allocation: Allocation) void {
-        var chunk = self.chunks.get(allocation.chunk_id).?;
-        chunk.free(allocation);
-    }
-
-    // Garbage Collect
-    pub fn gc(self: *Self) !void {
-        var items = try self.chunks.clone();
-        for (items.items()) |*chunk| {
-            if (chunk.value.allocated == 0) {
-                var id = chunk.value.id;
-                chunk.value.deinit();
-                self.allocator.destroy(chunk.value);
-                self.chunks.removeAssertDiscard(id);
-                self.chunk_count -= 1;
-            }
-        }
-        items.deinit();
-    }
-};
-
 const Block = struct {
-    id: vk.DeviceSize,
-
-    offset: vk.DeviceSize,
-    size: vk.DeviceSize,
-
-    atype: AllocationType,
-
-    prev: ?*Block,
-    next: ?*Block,
-};
-
-const Chunk = struct {
-    id: vk.DeviceSize,
-
-    allocator: *mem.Allocator,
+    const Layout = struct { offset: vk.DeviceSize, size: vk.DeviceSize, alloc_type: AllocationType };
 
     pfn: FunctionPointers,
-
     device: vk.Device,
 
     memory: vk.DeviceMemory,
+    usage: MemoryUsage,
     size: vk.DeviceSize,
     allocated: vk.DeviceSize,
 
-    usage: MemoryUsage,
-    memory_type_index: u32,
-
     data: []align(8) u8,
 
-    block_id: vk.DeviceSize,
-    head: *Block,
+    layout: std.ArrayList(Layout),
 
-    pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, device: vk.Device, size: vk.DeviceSize, usage: MemoryUsage, memoryTypeIndex: u32, id: vk.DeviceSize) !Chunk {
-        if (memoryTypeIndex == std.math.maxInt(u64)) {
-            return error.InvalidAllocationTypeIndex;
-        }
+    pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, device: vk.Device, size: vk.DeviceSize, usage: MemoryUsage, memory_type_index: u32) !Block {
+        var layout = std.ArrayList(Layout).init(allocator);
+        try layout.append(.{ .offset = 0, .size = size, .alloc_type = .Free });
 
-        const allocationInfo = vk.MemoryAllocateInfo{
+        const allocation_info = vk.MemoryAllocateInfo{
             .allocation_size = size,
 
-            .memory_type_index = memoryTypeIndex,
+            .memory_type_index = memory_type_index,
         };
 
         var memory: vk.DeviceMemory = undefined;
-        if (pfn.allocateMemory(device, &allocationInfo, null, &memory) != .success) return error.CannotMakeNewChunk;
+        if (pfn.allocateMemory(device, &allocation_info, null, &memory) != .success) return error.CannotMakeNewChunk;
 
         var data: []align(8) u8 = undefined;
-        if (usage != .GpuOnly) if(pfn.mapMemory(device, memory, 0, size, 0, @ptrCast(*?*c_void, &data)) != .success) return error.MapMemoryFailed;
+        if (usage != .GpuOnly) if (pfn.mapMemory(device, memory, 0, size, 0, @ptrCast(*?*c_void, &data)) != .success) return error.MapMemoryFailed;
 
-        var head = try allocator.create(Block);
-        head.* = Block{
-            .id = 0,
-
-            .offset = 0,
-            .size = size,
-
-            .atype = .Free,
-
-            .prev = null,
-            .next = null,
-        };
-
-        return Chunk{
-            .id = id,
-
-            .allocator = allocator,
-
+        return Block{
             .pfn = pfn,
-
             .device = device,
 
             .memory = memory,
+            .usage = usage,
             .size = size,
             .allocated = 0,
 
-            .usage = usage,
-            .memory_type_index = memoryTypeIndex,
-
             .data = data,
 
-            .block_id = 0,
-            .head = head,
+            .layout = layout,
         };
     }
 
-    pub fn deinit(self: *Chunk) void {
-        self.deinitBlock(self.head);
+    pub fn deinit(self: Block) void {
+        self.layout.deinit();
 
         if (self.usage != .GpuOnly) {
             self.pfn.unmapMemory(self.device, self.memory);
@@ -275,141 +97,256 @@ const Chunk = struct {
 
         self.pfn.freeMemory(self.device, self.memory, null);
     }
+};
 
-    fn deinitBlock(self: Chunk, block: *Block) void {
-        if (block.next) |next| {
-            if (next.next != null) self.deinitBlock(next) else self.allocator.destroy(next);
-        }
-        self.allocator.destroy(block);
-    }
+const Pool = struct {
+    allocator: *mem.Allocator,
 
-    pub fn alloc(self: *Chunk, size: vk.DeviceSize, alignment: vk.DeviceSize, granularity: vk.DeviceSize, allocType: AllocationType) !?Allocation {
-        const freeSize = self.size - self.allocated;
+    pfn: FunctionPointers,
+    device: vk.Device,
 
-        var curr: ?*Block = self.head;
+    image_granularity: vk.DeviceSize,
+    min_block_size: vk.DeviceSize,
+    memory_type_index: u32,
 
-        var offset: vk.DeviceSize = 0;
-        var alignedSize: vk.DeviceSize = 0;
+    blocks: std.ArrayList(?*Block),
 
-        var best: *Block = while (curr != null) : (curr = curr.?.next) {
-            if (curr.?.atype != .Free) continue;
-            if (size > curr.?.size) continue;
+    pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, device: vk.Device, image_granularity: vk.DeviceSize, min_block_size: vk.DeviceSize, memory_type_index: u32) Pool {
+        return Pool{
+            .allocator = allocator,
 
-            offset = alignOffset(curr.?.offset, alignment);
+            .pfn = pfn,
+            .device = device,
 
-            if (curr.?.prev != null and granularity > 1) {
-                var prev = curr.?.prev.?;
-                if ((prev.offset + prev.size - 1) & ~(granularity - 1) == offset & ~(granularity - 1)) {
-                    const atype = if (@enumToInt(prev.atype) > @enumToInt(allocType)) prev.atype else allocType;
+            .image_granularity = image_granularity,
+            .min_block_size = min_block_size,
+            .memory_type_index = memory_type_index,
 
-                    switch (atype) {
-                        .Buffer => {
-                            if (allocType == .Image or allocType == .ImageOptimal) offset = alignOffset(offset, granularity);
-                        },
-                        .Image => {
-                            if (allocType == .Image or allocType == .ImageLinear or allocType == .ImageOptimal) offset = alignOffset(offset, granularity);
-                        },
-                        .ImageLinear => {
-                            if (allocType == .ImageOptimal) offset = alignOffset(offset, granularity);
-                        },
-                        else => {},
-                    }
-                }
-            }
-
-            var padding = offset - curr.?.offset;
-            alignedSize = padding + size;
-
-            if (alignedSize > curr.?.size) continue;
-            if (alignedSize + self.allocated >= self.size) return error.OutOfMemory;
-
-            if (granularity > 1 and curr.?.next != null) {
-                const next = curr.?.next.?;
-                if ((next.offset + next.size - 1) & ~(granularity - 1) == offset & ~(granularity - 1)) {
-                    const atype = if (@enumToInt(next.atype) > @enumToInt(allocType)) next.atype else allocType;
-
-                    switch (atype) {
-                        .Buffer => if (allocType == .Image or allocType == .ImageOptimal) continue,
-                        .Image => if (allocType == .Image or allocType == .ImageLinear or allocType == .ImageOptimal) continue,
-                        .ImageLinear => if (allocType == .ImageOptimal) continue,
-                        else => {},
-                    }
-                }
-            }
-
-            break curr.?;
-        } else return null;
-
-        if (best.size > size) {
-            self.block_id += 1;
-
-            var block = try self.allocator.create(Block);
-            block.* = Block{
-                .id = self.block_id,
-
-                .size = best.size - alignedSize,
-                .offset = offset + size,
-
-                .atype = .Free,
-
-                .prev = best,
-                .next = best.next,
-            };
-
-            best.*.next = block;
-        }
-
-        best.*.atype = allocType;
-        best.*.size = size;
-
-        self.allocated += alignedSize;
-
-        return Allocation{
-            .chunk_id = self.id,
-            .block_id = best.id,
-
-            .memory = self.memory,
-
-            .size = size,
-            .offset = offset,
-
-            .data = if (self.usage != .GpuOnly) self.data[offset .. offset + size] else undefined,
+            .blocks = std.ArrayList(?*Block).init(allocator),
         };
     }
 
-    pub fn free(self: *Chunk, allocation: Allocation) void {
-        var curr: ?*Block = self.head;
-        while (curr != null) : (curr = curr.?.next) {
-            if (curr.?.id == allocation.block_id) break;
-        } else return;
-
-        curr.?.atype = .Free;
-
-        if (curr.?.prev != null and curr.?.prev.?.atype == .Free) {
-            var prev = curr.?.prev.?;
-
-            prev.next = curr.?.next;
-            if (curr.?.next != null) curr.?.next.?.prev = prev;
-
-            prev.size += curr.?.size;
-
-            self.allocator.destroy(curr.?);
+    pub fn deinit(self: Pool) void {
+        for (self.blocks.items) |b| {
+            if (b) |block| {
+                block.deinit();
+                self.allocator.destroy(block);
+            }
         }
-
-        if (curr.?.next != null and curr.?.next.?.atype == .Free) {
-            var next = curr.?.next.?;
-
-            if (next.next != null) next.next.?.prev = curr;
-
-            curr.?.next = next.next;
-
-            curr.?.size += next.size;
-
-            self.allocator.destroy(next);
-        }
-
-        self.allocated -= allocation.size;
+        self.blocks.deinit();
     }
+
+    pub fn alloc(self: *Pool, size: vk.DeviceSize, alignment: vk.DeviceSize, usage: MemoryUsage, alloc_type: AllocationType) !Allocation {
+        var found = false;
+        var location: struct { bid: usize, sid: usize, offset: vk.DeviceSize, size: vk.DeviceSize } = undefined;
+        outer: for (self.blocks.items) |b, i| if (b) |block| {
+            if (block.usage == .GpuOnly and usage != .GpuOnly) continue;
+            const block_free = block.size - block.allocated;
+
+            var offset: vk.DeviceSize = 0;
+            var aligned_size: vk.DeviceSize = 0;
+
+            for (block.layout.items) |span, j| {
+                if (span.alloc_type != .Free) continue;
+                if (span.size < size) continue;
+
+                offset = alignOffset(span.offset, alignment);
+
+                if (j >= 1 and self.image_granularity > 1) {
+                    const prev = block.layout.items[j - 1];
+                    if ((prev.offset + prev.size - 1) & ~(self.image_granularity - 1) == offset & ~(self.image_granularity - 1)) {
+                        const atype = if (@enumToInt(prev.alloc_type) > @enumToInt(alloc_type)) prev.alloc_type else alloc_type;
+
+                        switch (atype) {
+                            .Buffer => {
+                                if (alloc_type == .Image or alloc_type == .ImageOptimal) offset = alignOffset(offset, self.image_granularity);
+                            },
+                            .Image => {
+                                if (alloc_type == .Image or alloc_type == .ImageLinear or alloc_type == .ImageOptimal) offset = alignOffset(offset, self.image_granularity);
+                            },
+                            .ImageLinear => {
+                                if (alloc_type == .ImageOptimal) offset = alignOffset(offset, self.image_granularity);
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
+                var padding = offset - span.offset;
+                aligned_size = padding + size;
+
+                if (aligned_size > span.size) continue;
+                if (aligned_size > block_free) continue :outer;
+
+                if (j + 1 < block.layout.items.len and self.image_granularity > 1) {
+                    const next = block.layout.items[j + 1];
+                    if ((next.offset + next.size - 1) & ~(self.image_granularity - 1) == offset & ~(self.image_granularity - 1)) {
+                        const atype = if (@enumToInt(next.alloc_type) > @enumToInt(alloc_type)) next.alloc_type else alloc_type;
+
+                        switch (atype) {
+                            .Buffer => if (alloc_type == .Image or alloc_type == .ImageOptimal) continue,
+                            .Image => if (alloc_type == .Image or alloc_type == .ImageLinear or alloc_type == .ImageOptimal) continue,
+                            .ImageLinear => if (alloc_type == .ImageOptimal) continue,
+                            else => {},
+                        }
+                    }
+                }
+
+                found = true;
+                location = .{ .bid = i, .sid = j, .offset = offset, .size = aligned_size };
+                break :outer;
+            }
+        };
+
+        if (!found) {
+            var block_size: usize = 0;
+            while (block_size < size) {
+                block_size += self.min_block_size;
+            }
+            var block = try self.allocator.create(Block);
+            block.* = try Block.init(self.allocator, self.pfn, self.device, block_size, usage, self.memory_type_index);
+            try self.blocks.append(block);
+
+            location = .{ .bid = self.blocks.items.len - 1, .sid = 0, .offset = 0, .size = size };
+        }
+
+        const allocation = Allocation{
+            .block_id = location.bid,
+            .span_id = location.sid,
+            .memory_type_index = self.memory_type_index,
+
+            .memory = self.blocks.items[location.bid].?.memory,
+
+            .offset = location.offset,
+            .size = location.size,
+
+            .data = if (usage != .GpuOnly) self.blocks.items[location.bid].?.data[location.offset .. location.offset + size] else undefined,
+        };
+
+        var block = self.blocks.items[location.bid].?;
+
+        try block.layout.append(.{ .offset = block.layout.items[location.sid].offset + location.size, .size = block.layout.items[location.sid].size - location.size, .alloc_type = .Free });
+        block.layout.items[location.sid].size = location.size;
+        block.layout.items[location.sid].alloc_type = alloc_type;
+        block.allocated += location.size;
+
+        std.log.scoped(.zva).debug("\n----- Block {} -----", .{location.bid});
+        if (comptime std.debug.runtime_safety) {
+            for (block.layout.items) |layout| {
+                std.log.scoped(.zva).debug("{}", .{layout});
+            }
+        }
+        std.log.scoped(.zva).debug("----- ----- -----", .{});
+
+        return allocation;
+    }
+};
+
+pub const Allocator = struct {
+    const Self = @This();
+    allocator: *mem.Allocator,
+
+    pfn: FunctionPointers,
+    device: vk.Device,
+
+    memory_types: [vk.MAX_MEMORY_TYPES]vk.MemoryType,
+    memory_type_count: u32,
+
+    min_block_size: vk.DeviceSize,
+
+    pools: std.ArrayList(*Pool),
+
+    pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, physical_device: vk.PhysicalDevice, device: vk.Device, min_block_size: vk.DeviceSize) !Self {
+        var properties: vk.PhysicalDeviceProperties = undefined;
+        pfn.getPhysicalDeviceProperties(physical_device, &properties);
+        var mem_properties: vk.PhysicalDeviceMemoryProperties = undefined;
+        pfn.getPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
+
+        var pools = try std.ArrayList(*Pool).initCapacity(allocator, mem_properties.memory_type_count);
+        var i: usize = 0;
+        while (i < mem_properties.memory_type_count) : (i += 1) {
+            var pool = try allocator.create(Pool);
+            pool.* = Pool.init(allocator, pfn, device, properties.limits.buffer_image_granularity, min_block_size * 1024 * 1024, @intCast(u32, i));
+            try pools.append(pool);
+        }
+
+        return Self{
+            .allocator = allocator,
+
+            .pfn = pfn,
+            .device = device,
+
+            .memory_types = mem_properties.memory_types,
+            .memory_type_count = mem_properties.memory_type_count,
+
+            .min_block_size = min_block_size * 1024 * 1024,
+
+            .pools = pools,
+        };
+    }
+
+    pub fn deinit(self: Self) void {
+        for (self.pools.items) |pool| {
+            pool.deinit();
+            self.allocator.destroy(pool);
+        }
+        self.pools.deinit();
+    }
+
+    pub fn alloc(self: *Self, size: vk.DeviceSize, alignment: vk.DeviceSize, memory_type_bits: u32, usage: MemoryUsage, alloc_type: AllocationType) !Allocation {
+        var required_flags: vk.MemoryPropertyFlags = .{};
+        var preferred_flags: vk.MemoryPropertyFlags = .{};
+
+        switch (usage) {
+            .GpuOnly => preferred_flags = preferred_flags.merge(vk.MemoryPropertyFlags{ .device_local_bit = true }),
+            .CpuOnly => required_flags = required_flags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true, .host_coherent_bit = true }),
+            .GpuToCpu => {
+                required_flags = required_flags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true });
+                preferred_flags = preferred_flags.merge(vk.MemoryPropertyFlags{ .host_coherent_bit = true, .host_cached_bit = true });
+            },
+            .CpuToGpu => {
+                required_flags = required_flags.merge(vk.MemoryPropertyFlags{ .host_visible_bit = true });
+                preferred_flags = preferred_flags.merge(vk.MemoryPropertyFlags{ .device_local_bit = true });
+            },
+        }
+
+        var memory_type_index: u32 = 0;
+        var index_found = false;
+
+        while (memory_type_index < self.memory_type_count) : (memory_type_index += 1) {
+            if ((memory_type_bits >> @intCast(u5, memory_type_index)) & 1 == 0) {
+                continue;
+            }
+
+            const properties = self.memory_types[memory_type_index].property_flags;
+
+            if (!properties.contains(required_flags)) continue;
+            if (!properties.contains(preferred_flags)) continue;
+
+            index_found = true;
+            break;
+        }
+        if (!index_found) {
+            memory_type_index = 0;
+            while (memory_type_index < self.memory_type_count) : (memory_type_index += 1) {
+                if ((memory_type_bits >> @intCast(u5, memory_type_index)) & 1 == 0) {
+                    continue;
+                }
+
+                const properties = self.memory_types[memory_type_index].property_flags;
+                if (!properties.contains(required_flags)) continue;
+
+                index_found = true;
+                break;
+            }
+        }
+        if (!index_found) return error.MemoryTypeIndexNotFound;
+
+        var pool = self.pools.items[memory_type_index];
+        return pool.alloc(size, alignment, usage, alloc_type);
+    }
+
+    pub fn free(self: *Self, allocation: Allocation) void {}
 };
 
 inline fn alignOffset(offset: vk.DeviceSize, alignment: vk.DeviceSize) vk.DeviceSize {
