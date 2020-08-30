@@ -43,7 +43,7 @@ pub const FunctionPointers = struct {
 };
 
 const Block = struct {
-    const Layout = struct { offset: vk.DeviceSize, size: vk.DeviceSize, alloc_type: AllocationType };
+    const Layout = struct { offset: vk.DeviceSize, size: vk.DeviceSize, alloc_type: AllocationType, id: usize };
 
     pfn: FunctionPointers,
     device: vk.Device,
@@ -56,10 +56,11 @@ const Block = struct {
     data: []align(8) u8,
 
     layout: std.ArrayList(Layout),
+    layout_id: usize,
 
     pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, device: vk.Device, size: vk.DeviceSize, usage: MemoryUsage, memory_type_index: u32) !Block {
         var layout = std.ArrayList(Layout).init(allocator);
-        try layout.append(.{ .offset = 0, .size = size, .alloc_type = .Free });
+        try layout.append(.{ .offset = 0, .size = size, .alloc_type = .Free, .id = 0 });
 
         const allocation_info = vk.MemoryAllocateInfo{
             .allocation_size = size,
@@ -85,6 +86,7 @@ const Block = struct {
             .data = data,
 
             .layout = layout,
+            .layout_id = 1,
         };
     }
 
@@ -212,7 +214,7 @@ const Pool = struct {
 
         const allocation = Allocation{
             .block_id = location.bid,
-            .span_id = location.sid,
+            .span_id =  self.blocks.items[location.bid].?.layout.items[location.sid].id,
             .memory_type_index = self.memory_type_index,
 
             .memory = self.blocks.items[location.bid].?.memory,
@@ -225,20 +227,23 @@ const Pool = struct {
 
         var block = self.blocks.items[location.bid].?;
 
-        try block.layout.append(.{ .offset = block.layout.items[location.sid].offset + location.size, .size = block.layout.items[location.sid].size - location.size, .alloc_type = .Free });
+        try block.layout.append(.{ .offset = block.layout.items[location.sid].offset + location.size, .size = block.layout.items[location.sid].size - location.size, .alloc_type = .Free, .id = block.layout_id });
         block.layout.items[location.sid].size = location.size;
         block.layout.items[location.sid].alloc_type = alloc_type;
         block.allocated += location.size;
-
-        std.log.scoped(.zva).debug("\n----- Block {} -----", .{location.bid});
-        if (comptime std.debug.runtime_safety) {
-            for (block.layout.items) |layout| {
-                std.log.scoped(.zva).debug("{}", .{layout});
-            }
-        }
-        std.log.scoped(.zva).debug("----- ----- -----", .{});
+        block.layout_id += 1;
 
         return allocation;
+    }
+
+    pub fn free(self: *Pool, allocation: Allocation) void {
+        var block = self.blocks.items[allocation.block_id];
+        for (block.?.layout.items) |*layout, i| {
+            if (layout.id == allocation.span_id) {
+                layout.alloc_type = .Free;
+                break;
+            }
+        }
     }
 };
 
@@ -254,7 +259,7 @@ pub const Allocator = struct {
 
     min_block_size: vk.DeviceSize,
 
-    pools: std.ArrayList(*Pool),
+    pools: []*Pool,
 
     pub fn init(allocator: *mem.Allocator, pfn: FunctionPointers, physical_device: vk.PhysicalDevice, device: vk.Device, min_block_size: vk.DeviceSize) !Self {
         var properties: vk.PhysicalDeviceProperties = undefined;
@@ -262,12 +267,12 @@ pub const Allocator = struct {
         var mem_properties: vk.PhysicalDeviceMemoryProperties = undefined;
         pfn.getPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
 
-        var pools = try std.ArrayList(*Pool).initCapacity(allocator, mem_properties.memory_type_count);
+        var pools = try allocator.alloc(*Pool, mem_properties.memory_type_count);
         var i: usize = 0;
         while (i < mem_properties.memory_type_count) : (i += 1) {
             var pool = try allocator.create(Pool);
             pool.* = Pool.init(allocator, pfn, device, properties.limits.buffer_image_granularity, min_block_size * 1024 * 1024, @intCast(u32, i));
-            try pools.append(pool);
+            pools[i] = pool;
         }
 
         return Self{
@@ -286,11 +291,11 @@ pub const Allocator = struct {
     }
 
     pub fn deinit(self: Self) void {
-        for (self.pools.items) |pool| {
+        for (self.pools) |pool| {
             pool.deinit();
             self.allocator.destroy(pool);
         }
-        self.pools.deinit();
+        self.allocator.free(self.pools);
     }
 
     pub fn alloc(self: *Self, size: vk.DeviceSize, alignment: vk.DeviceSize, memory_type_bits: u32, usage: MemoryUsage, alloc_type: AllocationType) !Allocation {
@@ -342,11 +347,13 @@ pub const Allocator = struct {
         }
         if (!index_found) return error.MemoryTypeIndexNotFound;
 
-        var pool = self.pools.items[memory_type_index];
+        var pool = self.pools[memory_type_index];
         return pool.alloc(size, alignment, usage, alloc_type);
     }
 
-    pub fn free(self: *Self, allocation: Allocation) void {}
+    pub fn free(self: *Self, allocation: Allocation) void {
+        self.pools[allocation.memory_type_index].free(allocation);
+    }
 };
 
 inline fn alignOffset(offset: vk.DeviceSize, alignment: vk.DeviceSize) vk.DeviceSize {
